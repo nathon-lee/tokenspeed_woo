@@ -1,4 +1,4 @@
-"""Regression guard for ``AsyncLLM._wait_one_response`` cancellation.
+"""Regression guards for ``AsyncLLM`` request cancellation.
 
 Locks the contract Phase G.1 established: when the task driving a
 streaming generator is cancelled (e.g. FastAPI cancelling its route
@@ -28,6 +28,7 @@ from typing import Any, Dict  # noqa: E402
 
 from tokenspeed.runtime.engine.async_llm import AsyncLLM  # noqa: E402
 from tokenspeed.runtime.engine.collector import RequestOutputCollector  # noqa: E402
+from tokenspeed.runtime.engine.exceptions import EngineGenerateError  # noqa: E402
 from tokenspeed.runtime.engine.output_processor import ReqState  # noqa: E402
 
 
@@ -74,6 +75,41 @@ class _StubReqObj:
         self.input_ids = input_ids
         self.text = None
         self.sampling_params = {"skip_special_tokens": False}
+
+
+class _StubBatchReq:
+    def __init__(self, *, stream: bool) -> None:
+        self.stream = stream
+        self.batch_size = 2
+        self.parallel_sample_num = 1
+        self.requests = [
+            _StubReqObj(rid="r-failing", stream=stream),
+            _StubReqObj(rid="r-sibling", stream=stream),
+        ]
+
+    def __getitem__(self, index: int) -> _StubReqObj:
+        return self.requests[index]
+
+
+class _StubBatchAsyncLLM(_StubAsyncLLM):
+    async def _tokenize_one_request(self, obj: _StubReqObj) -> _StubReqObj:
+        return obj
+
+    def _send_one_request(
+        self,
+        obj: _StubReqObj,
+        tokenized_obj: _StubReqObj,
+        created_time: float | None = None,
+    ) -> None:
+        self.rid_to_state[obj.rid] = _fresh_state(obj)
+
+    async def _wait_one_response(self, obj: _StubReqObj):
+        if obj.rid == "r-failing":
+            await asyncio.sleep(0)
+            self.abort_request(obj.rid)
+            raise EngineGenerateError("batch member failed")
+        async for output in super()._wait_one_response(obj):
+            yield output
 
 
 def _fresh_state(obj: _StubReqObj) -> ReqState:
@@ -170,6 +206,31 @@ class TestWaitOneResponseCancellation(unittest.IsolatedAsyncioTestCase):
             0,
             "normal finish should not schedule an AbortReq",
         )
+
+
+class TestBatchResponseCancellation(unittest.IsolatedAsyncioTestCase):
+    async def _assert_failed_batch_cleans_up_sibling(self, *, stream: bool) -> None:
+        mgr = _StubBatchAsyncLLM()
+        obj = _StubBatchReq(stream=stream)
+
+        async def drain() -> None:
+            async for _ in mgr._handle_batch_request(obj):
+                pass
+
+        with self.assertRaisesRegex(EngineGenerateError, "batch member failed"):
+            await drain()
+
+        self.assertEqual(mgr.rid_to_state, {})
+        aborted_rids = {
+            abort.rid for abort in mgr.engine_core_client.send_to_scheduler.aborts
+        }
+        self.assertEqual(aborted_rids, {"r-failing", "r-sibling"})
+
+    async def test_non_streaming_error_cleans_up_sibling(self) -> None:
+        await self._assert_failed_batch_cleans_up_sibling(stream=False)
+
+    async def test_streaming_error_cleans_up_sibling(self) -> None:
+        await self._assert_failed_batch_cleans_up_sibling(stream=True)
 
 
 if __name__ == "__main__":
