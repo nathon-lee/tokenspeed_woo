@@ -73,9 +73,7 @@ class ReqState:
     tokenized_time: float = 0.0
     finished_time: float = 0.0
     first_token_time: float = 0.0
-    first_completion_tokens: int = 1
     last_time: float = 0.0
-    last_pure_time: float = 0.0
     last_completion_tokens: int = 1
 
     # For streaming output
@@ -333,9 +331,7 @@ class OutputProcessor:
 
         if state.first_token_time == 0.0:
             state.first_token_time = state.last_time = time.time()
-            state.last_pure_time = recv_obj.generated_time
             state.last_completion_tokens = completion_tokens
-            state.first_completion_tokens = completion_tokens
             self.engine.metrics.observe_time_to_first_token(
                 state.first_token_time - state.created_time
             )
@@ -344,15 +340,10 @@ class OutputProcessor:
             if num_new_tokens:
                 new_time = time.time()
                 interval = new_time - state.last_time
-                pure_interval = recv_obj.generated_time - state.last_pure_time
                 self.engine.metrics.observe_inter_token_latency(
                     interval,
                     num_new_tokens,
                 )
-                self.engine.metrics.observe_inter_token_latency(
-                    pure_interval, num_new_tokens
-                )
-                state.last_pure_time = recv_obj.generated_time
                 state.last_time = new_time
                 state.last_completion_tokens = completion_tokens
 
@@ -378,11 +369,6 @@ class OutputProcessor:
                     finished_ok=finished_ok,
                 )
             )
-            if (completion_tokens - state.first_completion_tokens) > 0:
-                self.engine.metrics.observe_inter_token_latency(
-                    state.finished_time - state.first_token_time,
-                    completion_tokens - state.first_completion_tokens,
-                )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
         import pickle as _pickle
