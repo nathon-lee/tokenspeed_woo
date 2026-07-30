@@ -497,27 +497,37 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
 
         # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
-        if not is_stream:
-            outputs = await asyncio.gather(*(gen.__anext__() for gen in generators))
-            yield outputs
-        else:
-            rid_to_index = {rid: i for i, rid in enumerate(rids)}
-            task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
-            while task_map:
-                done, _ = await asyncio.wait(
-                    task_map.keys(), return_when=asyncio.FIRST_COMPLETED
-                )
+        tasks = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
+        try:
+            if not is_stream:
+                outputs = await asyncio.gather(*tasks)
+                yield outputs
+            else:
+                rid_to_index = {rid: i for i, rid in enumerate(rids)}
+                while tasks:
+                    done, _ = await asyncio.wait(
+                        tasks.keys(), return_when=asyncio.FIRST_COMPLETED
+                    )
 
-                for task in done:
-                    gen = task_map.pop(task)
-                    try:
-                        result = task.result()
-                        result["index"] = rid_to_index[result["meta_info"]["id"]]
-                        yield result
-                        new_task = asyncio.create_task(gen.__anext__())
-                        task_map[new_task] = gen
-                    except StopAsyncIteration:
-                        pass
+                    for task in done:
+                        gen = tasks.pop(task)
+                        try:
+                            result = task.result()
+                            result["index"] = rid_to_index[result["meta_info"]["id"]]
+                            yield result
+                            new_task = asyncio.create_task(gen.__anext__())
+                            tasks[new_task] = gen
+                        except StopAsyncIteration:
+                            pass
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(
+                *(generator.aclose() for generator in generators),
+                return_exceptions=True,
+            )
 
     async def flush_cache(self) -> FlushCacheReqOutput:
         return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
