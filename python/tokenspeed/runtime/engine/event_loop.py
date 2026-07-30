@@ -1214,14 +1214,10 @@ class EventLoop:
 
     def _process_new_requests(self):
         recv_reqs = self.request_handler.recv_reqs()
-        # Snapshot the pause state before dispatch: process_requests may flip it
-        # mid-batch. If it was not blocked before but is after, a pause control
-        # message was processed in this very batch — which is what makes the
-        # FIFO edge below detectable (see TODO(pause-fifo)).
-        pause_blocked_before = self._pause.admit_blocked
-        new_req_specs, new_req_states, bootstrap_infos, abort_rids = (
+        new_req_specs, new_req_states, bootstrap_infos, abort_rids, pre_pause_rids = (
             self.request_handler.process_requests(recv_reqs)
         )
+        pre_pause_rid_set = set(pre_pause_rids)
         # Sweep TTL-expired abort markers every iteration. Without this
         # the map only gets cleaned inside ``mark_abort``, so a burst of
         # stale-cancel traffic followed by silence leaves the last batch
@@ -1240,7 +1236,8 @@ class EventLoop:
         # A pause(mode="abort") cancels every in-flight request through the same
         # marker path as a client abort; they finish on their next scheduled
         # step, then the drain check resolves the pause reply.
-        if self._pause.consume_abort_all():
+        abort_all_now = self._pause.consume_abort_all()
+        if abort_all_now:
             for rid in list(self.output_processor.rid_to_state.keys()):
                 # notify_client=True: pause aborts a passive client's request,
                 # so it must receive a terminating finish (unlike a client abort).
@@ -1362,30 +1359,33 @@ class EventLoop:
             else:
                 admitted_specs.append(spec)
 
-        # Pause gate: while paused, withhold new requests from the scheduler
-        # (running requests keep stepping); buffered specs are flushed on resume
-        # above, ahead of any newly-admitted ones, preserving FIFO order.
-        #
-        # TODO(pause-fifo): recv_reqs() drains the socket non-blocking, so a
-        # generate request that arrived *before* a pause control message can be
-        # coalesced into the same batch and reach here after the pause flipped
-        # admit_blocked. Such a pre-pause request is buffered as post-pause work
-        # instead of running (wait) / being aborted (abort). Correct handling
-        # needs the batch processed as an ordered stream that respects the
-        # control request's FIFO position. Tracked as a follow-up; until then we
-        # warn when the coalescing condition is observed so it is not silent.
+        # Pause gate: while paused, withhold post-pause requests from the
+        # scheduler. Same-batch pre-pause requests must preserve FIFO order:
+        # admit them as pre-pause work even if pause engaged later in the batch.
+        # For abort mode, mark those pre-pause requests for abort as soon as
+        # they are registered so they follow the same terminal path.
         if self._pause.admit_blocked:
-            if admitted_specs and not pause_blocked_before:
-                logger.warning(
-                    "Pause engaged in the same recv batch as %d generate "
-                    "request(s) (rids=%s); their FIFO order relative to the "
-                    "pause is not preserved, so a pre-pause request may be "
-                    "buffered as post-pause work and run only after resume. "
-                    "See TODO(pause-fifo).",
-                    len(admitted_specs),
-                    [spec.request_id for spec in admitted_specs],
-                )
-            self._pause.buffer_specs(admitted_specs)
+            pre_pause_specs = [
+                spec for spec in admitted_specs if spec.request_id in pre_pause_rid_set
+            ]
+            post_pause_specs = [
+                spec
+                for spec in admitted_specs
+                if spec.request_id not in pre_pause_rid_set
+            ]
+
+            if pre_pause_specs:
+                self.scheduler.submit_requests(pre_pause_specs)
+                if abort_all_now:
+                    for spec in pre_pause_specs:
+                        self._request_abort_or_mark(
+                            spec.request_id,
+                            "request aborted by pause",
+                            notify_client=True,
+                        )
+                        grammar_manager.mark_abort(spec.request_id)
+
+            self._pause.buffer_specs(post_pause_specs)
             return
 
         if admitted_specs:
