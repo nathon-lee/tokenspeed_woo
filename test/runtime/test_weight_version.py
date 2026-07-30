@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -37,10 +38,17 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.engine.collector import RequestOutputCollector  # noqa: E402
-from tokenspeed.runtime.engine.io_struct import BatchEmbeddingOut  # noqa: E402
+from tokenspeed.runtime.engine.io_struct import (  # noqa: E402
+    BatchEmbeddingOut,
+    BatchStrOut,
+)
 from tokenspeed.runtime.engine.output_processor import (  # noqa: E402
     OutputProcessor,
     ReqState,
+)
+from tokenspeed.runtime.engine.request_types import (  # noqa: E402
+    FINISH_ABORT,
+    FINISH_LENGTH,
 )
 from tokenspeed.runtime.engine.weight_transfer.manager import (  # noqa: E402
     WeightTransferManager,
@@ -214,6 +222,49 @@ class _Request:
     log_metrics = False
 
 
+class _RecordingMetrics:
+    def __init__(self) -> None:
+        self.request_finishes = []
+
+    def observe_time_to_first_token(self, *_args, **_kwargs) -> None:
+        return None
+
+    def observe_inter_token_latency(self, *_args, **_kwargs) -> None:
+        return None
+
+    def record_request_finish(self, stats) -> None:
+        self.request_finishes.append(stats)
+
+
+def _batch_str_out_with_finished_reason(finished_reason) -> BatchStrOut:
+    return BatchStrOut(
+        rids=["rid"],
+        finished_reasons=[finished_reason],
+        output_strs=["hello"],
+        output_ids=[[11]],
+        prompt_tokens=[3],
+        completion_tokens=[1],
+        cached_tokens=[0],
+        spec_verify_ct=[0],
+        input_token_logprobs_val=[],
+        input_token_logprobs_idx=[],
+        output_token_logprobs_val=[],
+        output_token_logprobs_idx=[],
+        input_top_logprobs_val=[],
+        input_top_logprobs_idx=[],
+        output_top_logprobs_val=[],
+        output_top_logprobs_idx=[],
+        input_token_ids_logprobs_val=[],
+        input_token_ids_logprobs_idx=[],
+        output_token_ids_logprobs_val=[],
+        output_token_ids_logprobs_idx=[],
+        output_hidden_states=[[]],
+        batch_accept_draft_tokens=[],
+        output_extra_infos=[],
+        generated_time=time.time(),
+    )
+
+
 class TestGenerationVersionStamp(unittest.TestCase):
     def test_output_meta_info_carries_current_version(self):
         engine = SimpleNamespace(
@@ -254,6 +305,60 @@ class TestGenerationVersionStamp(unittest.TestCase):
     def test_server_args_accepts_initial_version_from_cli(self):
         server_args = prepare_server_args(["model-x", "--weight-version", "policy-v1"])
         self.assertEqual(server_args.weight_version, "policy-v1")
+
+
+class TestFinishedReasonNormalization(unittest.TestCase):
+    def _build_engine(self, *, metrics) -> SimpleNamespace:
+        return SimpleNamespace(
+            server_args=SimpleNamespace(
+                weight_version="v-output",
+                speculative_algorithm=None,
+            ),
+            rid_to_state={},
+            enable_metrics=True,
+            metrics=metrics,
+            dump_requests_folder=False,
+        )
+
+    def _build_state(self) -> ReqState:
+        return ReqState(
+            RequestOutputCollector(),
+            False,
+            asyncio.Event(),
+            _Request(),
+            created_time=time.time(),
+        )
+
+    def test_finish_length_object_is_normalized_to_dict(self):
+        metrics = _RecordingMetrics()
+        engine = self._build_engine(metrics=metrics)
+        state = self._build_state()
+        engine.rid_to_state["rid"] = state
+
+        OutputProcessor(engine).handle_batch_output(
+            _batch_str_out_with_finished_reason(FINISH_LENGTH(length=1))
+        )
+
+        out = state.collector.take()
+        self.assertEqual(out["meta_info"]["finish_reason"], {"type": "length", "length": 1})
+        self.assertEqual(len(metrics.request_finishes), 1)
+        self.assertTrue(metrics.request_finishes[0].finished_ok)
+
+    def test_finish_abort_object_marks_finished_not_ok(self):
+        metrics = _RecordingMetrics()
+        engine = self._build_engine(metrics=metrics)
+        state = self._build_state()
+        engine.rid_to_state["rid"] = state
+
+        OutputProcessor(engine).handle_batch_output(
+            _batch_str_out_with_finished_reason(FINISH_ABORT(message="boom"))
+        )
+
+        out = state.collector.take()
+        self.assertEqual(out["meta_info"]["finish_reason"]["type"], "abort")
+        self.assertEqual(out["meta_info"]["finish_reason"]["message"], "boom")
+        self.assertEqual(len(metrics.request_finishes), 1)
+        self.assertFalse(metrics.request_finishes[0].finished_ok)
 
 
 if __name__ == "__main__":

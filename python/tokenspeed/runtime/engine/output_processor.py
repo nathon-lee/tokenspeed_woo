@@ -107,6 +107,39 @@ class OutputProcessor:
         self.engine = engine
         self.logprobs_processor = LogprobsProcessor(engine)
 
+    @staticmethod
+    def _normalize_finished_reason(finished_reason: Any) -> dict[str, Any] | None:
+        """Normalize finish reasons to a single dict-shaped contract.
+
+        Scheduler-side code usually sends JSON-like dicts, but older paths may
+        still hand over objects with ``to_json`` / ``is_error`` fields.
+        """
+        if finished_reason is None:
+            return None
+        if isinstance(finished_reason, dict):
+            return finished_reason
+
+        to_json = getattr(finished_reason, "to_json", None)
+        if callable(to_json):
+            normalized = to_json()
+            if isinstance(normalized, dict):
+                return normalized
+
+        # Compatibility fallback: preserve terminal semantics even when a
+        # non-standard object slips through.
+        is_error = bool(getattr(finished_reason, "is_error", False))
+        fallback: dict[str, Any] = {"type": "abort" if is_error else "unknown"}
+        message = getattr(finished_reason, "message", None)
+        if message is not None:
+            fallback["message"] = message
+        status_code = getattr(finished_reason, "status_code", None)
+        if status_code is not None:
+            fallback["status_code"] = status_code
+        err_type = getattr(finished_reason, "err_type", None)
+        if err_type is not None:
+            fallback["err_type"] = getattr(err_type, "value", err_type)
+        return fallback
+
     def handle_batch_output(
         self,
         recv_obj: BatchStrOut | BatchEmbeddingOut | BatchTokenIDOut,
@@ -120,10 +153,14 @@ class OutputProcessor:
                 )
                 continue
 
+            finished_reason = self._normalize_finished_reason(
+                recv_obj.finished_reasons[i]
+            )
+
             # Build meta_info and return value
             meta_info = {
                 "id": rid,
-                "finish_reason": recv_obj.finished_reasons[i],
+                "finish_reason": finished_reason,
                 "prompt_tokens": recv_obj.prompt_tokens[i],
                 "weight_version": self.engine.server_args.weight_version,
             }
@@ -208,7 +245,7 @@ class OutputProcessor:
                     incremental_emit = state.inline_detokenizer.process(
                         self.engine.tokenizer,
                         new_decode_ids=recv_obj.decode_ids[i],
-                        finished_reason=recv_obj.finished_reasons[i],
+                        finished_reason=finished_reason,
                         no_stop_trim=recv_obj.no_stop_trim[i],
                         skip_special_tokens=recv_obj.skip_special_tokens[i],
                         spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[
@@ -300,7 +337,7 @@ class OutputProcessor:
                     "meta_info": meta_info,
                 }
 
-            state.finished = recv_obj.finished_reasons[i] is not None
+            state.finished = finished_reason is not None
             if state.finished:
                 if self.engine.server_args.speculative_algorithm:
                     meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
@@ -316,7 +353,7 @@ class OutputProcessor:
             if self.engine.enable_metrics and not isinstance(
                 recv_obj, BatchEmbeddingOut
             ):
-                self.collect_metrics(state, recv_obj, i)
+                self.collect_metrics(state, recv_obj, i, finished_reason)
             if (
                 self.engine.dump_requests_folder
                 and state.finished
@@ -324,7 +361,13 @@ class OutputProcessor:
             ):
                 self.dump_requests(state, out_dict)
 
-    def collect_metrics(self, state: ReqState, recv_obj, i: int):
+    def collect_metrics(
+        self,
+        state: ReqState,
+        recv_obj,
+        i: int,
+        finished_reason: dict[str, Any] | None,
+    ):
         completion_tokens = (
             recv_obj.completion_tokens[i]
             if getattr(recv_obj, "completion_tokens", None)
@@ -357,13 +400,7 @@ class OutputProcessor:
                 state.last_completion_tokens = completion_tokens
 
         if state.finished:
-            fr = recv_obj.finished_reasons[i]
-            # TODO: consolidate the return type of fr.
-            finished_ok = not (
-                fr.get("type") == "abort"
-                if isinstance(fr, dict)
-                else getattr(fr, "is_error", False)
-            )
+            finished_ok = finished_reason is None or finished_reason.get("type") != "abort"
             cached_prompt = (
                 recv_obj.cached_tokens[i]
                 if getattr(recv_obj, "cached_tokens", None) is not None
