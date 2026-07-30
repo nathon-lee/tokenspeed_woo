@@ -191,8 +191,21 @@ class RequestHandler:
         return recv_reqs
 
     def process_requests(self, recv_reqs: list):
-        """Dispatch control requests and return new generate request specs and states."""
+        """Dispatch requests and return generate work plus FIFO pause metadata.
+
+        Returns:
+            new_req_specs: generated RequestSpecs in recv order.
+            req_states: RequestState objects aligned with new_req_specs.
+            bootstrap_infos: BootstrapInfo aligned with new_req_specs.
+            abort_rids: request ids from AbortReq controls in recv order.
+            pre_pause_generate_rids: request ids for generate requests that
+                appeared before the first pause control request that flipped
+                ``pause_controller.admit_blocked`` from False to True in this
+                same recv batch.
+        """
         new_req_specs, req_states, bootstrap_infos, abort_rids = [], [], [], []
+        pre_pause_generate_rids = []
+        pause_flipped_in_batch = False
         for recv_req in recv_reqs:
             if isinstance(recv_req, TokenizedGenerateReqInput):
                 req_spec, req_state, bootstrap_info = self.handle_generate_request(
@@ -202,6 +215,8 @@ class RequestHandler:
                 new_req_specs.append(req_spec)
                 req_states.append(req_state)
                 bootstrap_infos.append(bootstrap_info)
+                if not pause_flipped_in_batch:
+                    pre_pause_generate_rids.append(req_spec.request_id)
             elif isinstance(recv_req, ProfileReq):
                 output = self.control_request_dispatcher(recv_req)
                 if output is not None:
@@ -216,7 +231,14 @@ class RequestHandler:
             elif isinstance(recv_req, PauseSchedulerReqInput):
                 # State change + reply (abort/wait replies are deferred by the
                 # controller until the event loop observes a drained scheduler).
+                pause_blocked_before = self.pause_controller.admit_blocked
                 self.pause_controller.handle_pause(recv_req)
+                if (
+                    not pause_blocked_before
+                    and self.pause_controller.admit_blocked
+                    and not pause_flipped_in_batch
+                ):
+                    pause_flipped_in_batch = True
             elif isinstance(recv_req, ResumeSchedulerReqInput):
                 self.pause_controller.handle_resume(recv_req)
             elif isinstance(recv_req, IsSchedulerPausedReqInput):
@@ -259,7 +281,13 @@ class RequestHandler:
                 )
             else:
                 raise NotImplementedError(f"Unsupported request type: {type(recv_req)}")
-        return new_req_specs, req_states, bootstrap_infos, abort_rids
+        return (
+            new_req_specs,
+            req_states,
+            bootstrap_infos,
+            abort_rids,
+            pre_pause_generate_rids,
+        )
 
     def handle_generate_request(
         self,
